@@ -1,0 +1,800 @@
+// Master_GPS_WiFi_Cloud.ino
+// ESP32 + SX127x + SD Card + Buzzer + WiFi Dashboard + Cloud Upload
+// Features: GPS tracking, web dashboard, Ubidots integration, smart alerts
+
+#include <SPI.h>
+#include <LoRa.h>
+#include <SD.h>
+#include <ArduinoJson.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <HTTPClient.h>
+#include <TinyGPS++.h>
+#include <HardwareSerial.h>
+
+// ============ LORA PINS ============
+#define LORA_NSS    5
+#define LORA_RST    14
+#define LORA_DIO0   26
+#define LORA_SCK    18
+#define LORA_MISO   19
+#define LORA_MOSI   23
+
+// ============ SD CARD PINS ============
+#define SD_CS       15
+
+// ============ OTHER PINS ============
+#define BUZZER_PIN  27
+#define GPS_RX      16
+#define GPS_TX      17
+
+// ============ WiFi CONFIG ============
+// Mode 1: ESP32 creates hotspot
+#define WIFI_MODE_AP true  // Set false to connect to external WiFi
+const char* AP_SSID = "LoRa_Network";
+const char* AP_PASS = "lora12345";
+
+// Mode 2: Connect to laptop hotspot (if WIFI_MODE_AP = false)
+const char* STA_SSID = "YourLaptopHotspot";
+const char* STA_PASS = "yourpassword";
+
+// ============ UBIDOTS CONFIG ============
+#define UBIDOTS_TOKEN "YOUR_UBIDOTS_TOKEN_HERE"
+#define UBIDOTS_DEVICE "lora-master"
+const char* ubidotsServer = "industrial.api.ubidots.com";
+
+// ============ NODE CONFIG ============
+const String nodes[] = {"NODE1", "NODE2", "NODE3"};
+const int NODE_COUNT = sizeof(nodes) / sizeof(nodes[0]);
+
+// ============ TIMING CONFIG ============
+#define POLL_INTERVAL     3000
+#define RESPONSE_TIMEOUT  1500
+#define MAX_RETRIES       2
+#define CLOUD_UPLOAD_INTERVAL 60000  // Upload every 60 seconds
+#define OFFLINE_THRESHOLD 900000     // 15 minutes
+#define SD_CLEANUP_DAYS   7          // Keep data for 7 days
+
+// ============ ALERT THRESHOLDS ============
+#define FALL_THRESHOLD    10.0   // 10m altitude drop
+#define BATTERY_LOW       15     // 15% battery warning
+#define MOVEMENT_THRESHOLD 100.0 // 100m GPS movement
+
+struct NodeData {
+  String nodeId;
+  float temp;
+  float pres;
+  float alt;
+  int battery;
+  int alert;
+  float lat;
+  float lng;
+  int rssi;
+  float snr;
+  unsigned long lastSeen;
+  float prevAlt;
+  float prevLat;
+  float prevLng;
+  bool offline;
+};
+
+struct NodeState {
+  bool awaiting = false;
+  unsigned long lastSend = 0;
+  int retries = 0;
+};
+
+NodeState nodeState[NODE_COUNT];
+NodeData nodeData[NODE_COUNT];
+int currentIndex = 0;
+unsigned long lastPollCycle = 0;
+unsigned long lastCloudUpload = 0;
+bool alertPending = false;
+
+bool sdCardOK = false;
+String logFileName = "/data.txt";
+String alertFileName = "/alerts.txt";
+
+TinyGPSPlus gps;
+HardwareSerial GPS_Serial(1);
+WebServer server(80);
+
+// Fallback GPS coordinates (Bangalore)
+#define FALLBACK_LAT 12.9716
+#define FALLBACK_LNG 77.5946
+
+bool wifiConnected = false;
+bool internetAvailable = false;
+
+// ============================================
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  Serial.println("\n=== LoRa Master with GPS & Cloud ===");
+
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+
+  // Initialize GPS
+  GPS_Serial.begin(9600, SERIAL_8N1, GPS_RX, GPS_TX);
+  Serial.println("GPS initialized");
+
+  // Startup beeps
+  beep(100);
+  delay(100);
+  beep(100);
+
+  // Initialize LoRa
+  SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_NSS);
+  LoRa.setPins(LORA_NSS, LORA_RST, LORA_DIO0);
+
+  if (!LoRa.begin(433E6)) {
+    Serial.println("ERROR: LoRa init failed!");
+    while (1) {
+      beep(50);
+      delay(500);
+    }
+  }
+  Serial.println("✓ LoRa initialized");
+
+  // Initialize SD Card
+  if (!SD.begin(SD_CS)) {
+    Serial.println("WARNING: SD Card init failed!");
+    sdCardOK = false;
+  } else {
+    sdCardOK = true;
+    Serial.println("✓ SD Card initialized");
+    
+    if (!SD.exists(logFileName)) {
+      writeLogHeader();
+    }
+    if (!SD.exists(alertFileName)) {
+      writeAlertHeader();
+    }
+  }
+
+  // Initialize WiFi
+  setupWiFi();
+
+  // Initialize web server
+  setupWebServer();
+
+  // Initialize node data
+  for (int i = 0; i < NODE_COUNT; i++) {
+    nodeData[i].nodeId = nodes[i];
+    nodeData[i].offline = false;
+    nodeData[i].lastSeen = 0;
+    nodeData[i].prevAlt = 0;
+    nodeData[i].prevLat = FALLBACK_LAT;
+    nodeData[i].prevLng = FALLBACK_LNG;
+  }
+
+  Serial.println("=== Master Ready ===\n");
+  beep(100);
+}
+
+// ============================================
+void loop() {
+  unsigned long now = millis();
+
+  // Update GPS
+  while (GPS_Serial.available() > 0) {
+    gps.encode(GPS_Serial.read());
+  }
+
+  // Handle web server
+  server.handleClient();
+
+  // Handle incoming LoRa packets
+  int packetSize = LoRa.parsePacket();
+  if (packetSize) {
+    String incoming = "";
+    while (LoRa.available()) {
+      incoming += (char)LoRa.read();
+    }
+    incoming.trim();
+
+    if (incoming.length() > 0) {
+      int rssi = LoRa.packetRssi();
+      float snr = LoRa.packetSnr();
+      
+      Serial.print("[RX RSSI=");
+      Serial.print(rssi);
+      Serial.print(" SNR=");
+      Serial.print(snr);
+      Serial.print("] ");
+      Serial.println(incoming);
+      
+      handleIncoming(incoming, rssi, snr);
+    }
+  }
+
+  // Poll next node
+  if (!nodeState[currentIndex].awaiting &&
+      (now - lastPollCycle >= POLL_INTERVAL)) {
+    lastPollCycle = now;
+    pollNode(currentIndex);
+  }
+
+  // Handle timeouts
+  for (int i = 0; i < NODE_COUNT; i++) {
+    if (nodeState[i].awaiting &&
+        (now - nodeState[i].lastSend > RESPONSE_TIMEOUT)) {
+      
+      Serial.print("⏱ Timeout: ");
+      Serial.println(nodes[i]);
+      
+      nodeState[i].retries++;
+
+      if (nodeState[i].retries < MAX_RETRIES) {
+        Serial.print("🔄 Retry ");
+        Serial.print(nodes[i]);
+        pollNode(i);
+      } else {
+        Serial.print("❌ Skipping ");
+        Serial.println(nodes[i]);
+        logTimeout(nodes[i]);
+        nodeState[i].awaiting = false;
+        nodeState[i].retries = 0;
+        currentIndex = (currentIndex + 1) % NODE_COUNT;
+      }
+    }
+  }
+
+  // Check for offline nodes
+  checkOfflineNodes(now);
+
+  // Cloud upload
+  if (internetAvailable && (now - lastCloudUpload >= CLOUD_UPLOAD_INTERVAL)) {
+    lastCloudUpload = now;
+    uploadToCloud();
+  }
+
+  // Handle alerts
+  if (alertPending) {
+    broadcastAlert();
+    alertPending = false;
+  }
+}
+
+// ============================================
+void setupWiFi() {
+  if (WIFI_MODE_AP) {
+    // Create Access Point
+    WiFi.softAP(AP_SSID, AP_PASS);
+    IPAddress IP = WiFi.softAPIP();
+    Serial.print("AP IP: ");
+    Serial.println(IP);
+    wifiConnected = true;
+    internetAvailable = false;
+  } else {
+    // Connect to external WiFi
+    WiFi.begin(STA_SSID, STA_PASS);
+    Serial.print("Connecting to WiFi");
+    
+    int attempts = 0;
+    while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+      delay(500);
+      Serial.print(".");
+      attempts++;
+    }
+    
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.println("\n✓ WiFi connected");
+      Serial.print("IP: ");
+      Serial.println(WiFi.localIP());
+      wifiConnected = true;
+      internetAvailable = checkInternet();
+    } else {
+      Serial.println("\n❌ WiFi failed, starting AP");
+      WiFi.softAP(AP_SSID, AP_PASS);
+      wifiConnected = true;
+      internetAvailable = false;
+    }
+  }
+}
+
+// ============================================
+bool checkInternet() {
+  HTTPClient http;
+  http.begin("http://www.google.com");
+  int httpCode = http.GET();
+  http.end();
+  return (httpCode > 0);
+}
+
+// ============================================
+void setupWebServer() {
+  // Main dashboard
+  server.on("/", HTTP_GET, handleRoot);
+  
+  // API endpoints
+  server.on("/api/nodes", HTTP_GET, handleAPINodes);
+  server.on("/api/alerts", HTTP_GET, handleAPIAlerts);
+  server.on("/api/download", HTTP_GET, handleDownload);
+  server.on("/api/clear", HTTP_GET, handleClearSD);
+  
+  server.begin();
+  Serial.println("Web server started");
+}
+
+// ============================================
+void handleRoot() {
+  String html = getHTML();
+  server.send(200, "text/html", html);
+}
+
+// ============================================
+void handleAPINodes() {
+  StaticJsonDocument<1024> doc;
+  JsonArray array = doc.createNestedArray("nodes");
+  
+  for (int i = 0; i < NODE_COUNT; i++) {
+    JsonObject node = array.createNestedObject();
+    node["id"] = nodeData[i].nodeId;
+    node["temp"] = nodeData[i].temp;
+    node["pres"] = nodeData[i].pres;
+    node["alt"] = nodeData[i].alt;
+    node["bat"] = nodeData[i].battery;
+    node["lat"] = nodeData[i].lat;
+    node["lng"] = nodeData[i].lng;
+    node["rssi"] = nodeData[i].rssi;
+    node["snr"] = nodeData[i].snr;
+    node["alert"] = nodeData[i].alert;
+    node["offline"] = nodeData[i].offline;
+    node["lastSeen"] = (millis() - nodeData[i].lastSeen) / 1000;
+  }
+  
+  String response;
+  serializeJson(doc, response);
+  server.send(200, "application/json", response);
+}
+
+// ============================================
+void handleAPIAlerts() {
+  if (!sdCardOK) {
+    server.send(500, "text/plain", "SD card not available");
+    return;
+  }
+  
+  File file = SD.open(alertFileName);
+  if (file) {
+    String content = file.readString();
+    file.close();
+    server.send(200, "text/plain", content);
+  } else {
+    server.send(404, "text/plain", "No alerts");
+  }
+}
+
+// ============================================
+void handleDownload() {
+  if (!sdCardOK) {
+    server.send(500, "text/plain", "SD card not available");
+    return;
+  }
+  
+  File file = SD.open(logFileName);
+  if (file) {
+    server.streamFile(file, "text/csv");
+    file.close();
+  } else {
+    server.send(404, "text/plain", "No data");
+  }
+}
+
+// ============================================
+void handleClearSD() {
+  if (sdCardOK) {
+    SD.remove(logFileName);
+    SD.remove(alertFileName);
+    writeLogHeader();
+    writeAlertHeader();
+    server.send(200, "text/plain", "SD card cleared");
+  } else {
+    server.send(500, "text/plain", "SD card not available");
+  }
+}
+
+// ============================================
+void pollNode(int index) {
+  String req = "REQ:" + nodes[index];
+  
+  LoRa.beginPacket();
+  LoRa.print(req);
+  LoRa.endPacket();
+
+  nodeState[index].awaiting = true;
+  nodeState[index].lastSend = millis();
+
+  Serial.print("📤 Poll -> ");
+  Serial.println(req);
+}
+
+// ============================================
+void handleIncoming(const String &payload, int rssi, float snr) {
+  if (payload.startsWith("{") && payload.endsWith("}")) {
+    
+    StaticJsonDocument<256> doc;
+    DeserializationError error = deserializeJson(doc, payload);
+
+    if (error) {
+      Serial.print("JSON parse error: ");
+      Serial.println(error.c_str());
+      return;
+    }
+
+    const char* nodeId = doc["node"];
+    if (nodeId == nullptr) return;
+
+    // Find node index
+    int nodeIdx = -1;
+    for (int i = 0; i < NODE_COUNT; i++) {
+      if (nodes[i] == String(nodeId)) {
+        nodeIdx = i;
+        nodeState[i].awaiting = false;
+        nodeState[i].retries = 0;
+        break;
+      }
+    }
+
+    if (nodeIdx == -1) return;
+
+    // Update node data
+    nodeData[nodeIdx].temp = doc["temp"].as<float>();
+    nodeData[nodeIdx].pres = doc["pres"].as<float>();
+    nodeData[nodeIdx].alt = doc["alt"].as<float>();
+    nodeData[nodeIdx].battery = doc["bat"].as<int>();
+    nodeData[nodeIdx].alert = doc["alert"].as<int>();
+    nodeData[nodeIdx].lat = doc["lat"] | FALLBACK_LAT;
+    nodeData[nodeIdx].lng = doc["lng"] | FALLBACK_LNG;
+    nodeData[nodeIdx].rssi = rssi;
+    nodeData[nodeIdx].snr = snr;
+    nodeData[nodeIdx].lastSeen = millis();
+    nodeData[nodeIdx].offline = false;
+
+    // Display data
+    Serial.println("┌──────────────────────┐");
+    Serial.printf("Node: %s\n", nodeId);
+    Serial.printf("Temp: %.2f °C\n", nodeData[nodeIdx].temp);
+    Serial.printf("Pressure: %.1f hPa\n", nodeData[nodeIdx].pres);
+    Serial.printf("Altitude: %.0f m\n", nodeData[nodeIdx].alt);
+    Serial.printf("Battery: %d%%\n", nodeData[nodeIdx].battery);
+    Serial.printf("GPS: %.6f, %.6f\n", nodeData[nodeIdx].lat, nodeData[nodeIdx].lng);
+    Serial.println("└──────────────────────┘");
+
+    // Log to SD
+    logData(payload, nodeId, rssi, snr);
+
+    // Smart Alerts
+    checkSmartAlerts(nodeIdx);
+
+    // Manual alert
+    if (nodeData[nodeIdx].alert == 1) {
+      logAlert(nodeId, "Manual button press");
+      alertPending = true;
+    }
+
+    // Move to next node
+    currentIndex = (currentIndex + 1) % NODE_COUNT;
+  }
+}
+
+// ============================================
+void checkSmartAlerts(int idx) {
+  String nodeId = nodeData[idx].nodeId;
+  
+  // Fall detection
+  if (nodeData[idx].prevAlt > 0) {
+    float altDrop = nodeData[idx].prevAlt - nodeData[idx].alt;
+    if (altDrop > FALL_THRESHOLD) {
+      String msg = "Fall detected: " + String(altDrop, 1) + "m drop";
+      logAlert(nodeId, msg);
+      Serial.println("🚨 " + msg);
+      alertPending = true;
+      for (int i = 0; i < 5; i++) {
+        beep(100);
+        delay(100);
+      }
+    }
+  }
+  nodeData[idx].prevAlt = nodeData[idx].alt;
+  
+  // Low battery
+  if (nodeData[idx].battery < BATTERY_LOW) {
+    String msg = "Low battery: " + String(nodeData[idx].battery) + "%";
+    logAlert(nodeId, msg);
+    Serial.println("🔋 " + msg);
+  }
+  
+  // Movement detection
+  if (nodeData[idx].prevLat != FALLBACK_LAT) {
+    float dist = calculateDistance(
+      nodeData[idx].prevLat, nodeData[idx].prevLng,
+      nodeData[idx].lat, nodeData[idx].lng
+    );
+    if (dist > MOVEMENT_THRESHOLD) {
+      String msg = "Large movement: " + String(dist, 1) + "m";
+      logAlert(nodeId, msg);
+      Serial.println("🚶 " + msg);
+    }
+  }
+  nodeData[idx].prevLat = nodeData[idx].lat;
+  nodeData[idx].prevLng = nodeData[idx].lng;
+}
+
+// ============================================
+void checkOfflineNodes(unsigned long now) {
+  for (int i = 0; i < NODE_COUNT; i++) {
+    if (nodeData[i].lastSeen > 0 && 
+        !nodeData[i].offline &&
+        (now - nodeData[i].lastSeen > OFFLINE_THRESHOLD)) {
+      nodeData[i].offline = true;
+      String msg = "Node offline (15+ min)";
+      logAlert(nodeData[i].nodeId, msg);
+      Serial.println("📵 " + nodeData[i].nodeId + " " + msg);
+    }
+  }
+}
+
+// ============================================
+float calculateDistance(float lat1, float lng1, float lat2, float lng2) {
+  // Haversine formula for distance in meters
+  float dLat = (lat2 - lat1) * DEG_TO_RAD;
+  float dLng = (lng2 - lng1) * DEG_TO_RAD;
+  float a = sin(dLat/2) * sin(dLat/2) +
+            cos(lat1 * DEG_TO_RAD) * cos(lat2 * DEG_TO_RAD) *
+            sin(dLng/2) * sin(dLng/2);
+  float c = 2 * atan2(sqrt(a), sqrt(1-a));
+  return 6371000 * c; // Earth radius in meters
+}
+
+// ============================================
+void uploadToCloud() {
+  if (!internetAvailable) return;
+  
+  HTTPClient http;
+  
+  for (int i = 0; i < NODE_COUNT; i++) {
+    if (nodeData[i].lastSeen == 0) continue;
+    
+    String url = "http://" + String(ubidotsServer) + "/api/v1.6/devices/" + 
+                 nodeData[i].nodeId.toLowerCase();
+    
+    http.begin(url);
+    http.addHeader("Content-Type", "application/json");
+    http.addHeader("X-Auth-Token", UBIDOTS_TOKEN);
+    
+    StaticJsonDocument<512> doc;
+    doc["temperature"] = nodeData[i].temp;
+    doc["pressure"] = nodeData[i].pres;
+    doc["altitude"] = nodeData[i].alt;
+    doc["battery"] = nodeData[i].battery;
+    doc["latitude"] = nodeData[i].lat;
+    doc["longitude"] = nodeData[i].lng;
+    doc["rssi"] = nodeData[i].rssi;
+    doc["alert"] = nodeData[i].alert;
+    
+    String json;
+    serializeJson(doc, json);
+    
+    int httpCode = http.POST(json);
+    
+    if (httpCode > 0) {
+      Serial.printf("☁️ Uploaded %s: %d\n", nodeData[i].nodeId.c_str(), httpCode);
+    } else {
+      Serial.printf("❌ Upload failed %s\n", nodeData[i].nodeId.c_str());
+    }
+    
+    http.end();
+    delay(1000); // Rate limiting
+  }
+}
+
+// ============================================
+void broadcastAlert() {
+  Serial.println("\n🚨 BROADCASTING ALERT 🚨");
+  
+  for (int i = 0; i < 3; i++) {
+    beep(200);
+    delay(200);
+  }
+
+  LoRa.beginPacket();
+  LoRa.print("BROADCAST:ALERT");
+  LoRa.endPacket();
+}
+
+// ============================================
+void beep(int duration) {
+  digitalWrite(BUZZER_PIN, HIGH);
+  delay(duration);
+  digitalWrite(BUZZER_PIN, LOW);
+}
+
+// ============================================
+void writeLogHeader() {
+  File file = SD.open(logFileName, FILE_WRITE);
+  if (file) {
+    file.println("Timestamp,NodeID,Temp,Pressure,Altitude,Battery,Latitude,Longitude,Alert,RSSI,SNR,JSON");
+    file.close();
+  }
+}
+
+// ============================================
+void writeAlertHeader() {
+  File file = SD.open(alertFileName, FILE_WRITE);
+  if (file) {
+    file.println("Timestamp,NodeID,AlertType,Message");
+    file.close();
+  }
+}
+
+// ============================================
+void logData(const String &jsonStr, const String &nodeId, int rssi, float snr) {
+  if (!sdCardOK) return;
+
+  StaticJsonDocument<256> doc;
+  deserializeJson(doc, jsonStr);
+
+  File file = SD.open(logFileName, FILE_APPEND);
+  if (file) {
+    file.print(millis());
+    file.print(",");
+    file.print(nodeId);
+    file.print(",");
+    file.print(doc["temp"].as<float>());
+    file.print(",");
+    file.print(doc["pres"].as<float>());
+    file.print(",");
+    file.print(doc["alt"].as<float>());
+    file.print(",");
+    file.print(doc["bat"].as<int>());
+    file.print(",");
+    file.print(doc["lat"] | FALLBACK_LAT, 6);
+    file.print(",");
+    file.print(doc["lng"] | FALLBACK_LNG, 6);
+    file.print(",");
+    file.print(doc["alert"].as<int>());
+    file.print(",");
+    file.print(rssi);
+    file.print(",");
+    file.print(snr);
+    file.print(",");
+    file.println(jsonStr);
+    file.close();
+  }
+}
+
+// ============================================
+void logAlert(const String &nodeId, const String &message) {
+  if (!sdCardOK) return;
+
+  File file = SD.open(alertFileName, FILE_APPEND);
+  if (file) {
+    file.print(millis());
+    file.print(",");
+    file.print(nodeId);
+    file.print(",");
+    file.print(message);
+    file.println();
+    file.close();
+  }
+}
+
+// ============================================
+void logTimeout(const String &nodeId) {
+  if (!sdCardOK) return;
+
+  File file = SD.open(logFileName, FILE_APPEND);
+  if (file) {
+    file.print(millis());
+    file.print(",");
+    file.print(nodeId);
+    file.println(",TIMEOUT,,,,,,,,,");
+    file.close();
+  }
+}
+
+// ============================================
+String getHTML() {
+  return R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <title>LoRa Network Dashboard</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    body { font-family: Arial; margin: 0; padding: 20px; background: #1a1a1a; color: #fff; }
+    h1 { color: #00ff88; }
+    .container { max-width: 1200px; margin: auto; }
+    .node-card { background: #2a2a2a; padding: 15px; margin: 10px 0; border-radius: 8px; border-left: 4px solid #00ff88; }
+    .node-card.offline { border-left-color: #ff4444; }
+    .node-card.warning { border-left-color: #ffaa00; }
+    .stat { display: inline-block; margin: 5px 15px 5px 0; }
+    .label { color: #888; font-size: 12px; }
+    .value { font-size: 18px; font-weight: bold; }
+    .alert { background: #ff4444; padding: 10px; margin: 10px 0; border-radius: 4px; }
+    .btn { background: #00ff88; color: #000; padding: 10px 20px; border: none; border-radius: 4px; cursor: pointer; margin: 5px; }
+    .btn:hover { background: #00cc66; }
+    #map { height: 400px; background: #333; border-radius: 8px; margin: 20px 0; }
+  </style>
+  <script src="https://unpkg.com/leaflet@1.7.1/dist/leaflet.js"></script>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.7.1/dist/leaflet.css" />
+</head>
+<body>
+  <div class="container">
+    <h1>🛰️ LoRa Sensor Network</h1>
+    <div>
+      <button class="btn" onclick="refreshData()">🔄 Refresh</button>
+      <button class="btn" onclick="downloadData()">📥 Download CSV</button>
+      <button class="btn" onclick="clearSD()">🗑️ Clear SD Card</button>
+    </div>
+    <div id="map"></div>
+    <div id="nodes"></div>
+    <h2>Recent Alerts</h2>
+    <div id="alerts"></div>
+  </div>
+  <script>
+    var map = L.map('map').setView([12.9716, 77.5946], 13);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png').addTo(map);
+    var markers = {};
+    
+    function refreshData() {
+      fetch('/api/nodes')
+        .then(r => r.json())
+        .then(data => {
+          let html = '';
+          data.nodes.forEach(n => {
+            let status = n.offline ? 'offline' : (n.bat < 15 ? 'warning' : '');
+            html += `<div class="node-card ${status}">
+              <h3>${n.id} ${n.offline ? '📵 OFFLINE' : '✅'}</h3>
+              <div class="stat"><div class="label">Temperature</div><div class="value">${n.temp.toFixed(1)}°C</div></div>
+              <div class="stat"><div class="label">Pressure</div><div class="value">${n.pres.toFixed(1)} hPa</div></div>
+              <div class="stat"><div class="label">Altitude</div><div class="value">${n.alt.toFixed(0)} m</div></div>
+              <div class="stat"><div class="label">Battery</div><div class="value">${n.bat}%</div></div>
+              <div class="stat"><div class="label">RSSI</div><div class="value">${n.rssi} dBm</div></div>
+              <div class="stat"><div class="label">GPS</div><div class="value">${n.lat.toFixed(4)}, ${n.lng.toFixed(4)}</div></div>
+              <div class="stat"><div class="label">Last Seen</div><div class="value">${n.lastSeen}s ago</div></div>
+            </div>`;
+            
+            // Update map marker
+            if (!markers[n.id]) {
+              markers[n.id] = L.marker([n.lat, n.lng]).addTo(map)
+                .bindPopup(`<b>${n.id}</b><br>Temp: ${n.temp}°C<br>Alt: ${n.alt}m<br>Bat: ${n.bat}%`);
+            } else {
+              markers[n.id].setLatLng([n.lat, n.lng]).setPopupContent(
+                `<b>${n.id}</b><br>Temp: ${n.temp}°C<br>Alt: ${n.alt}m<br>Bat: ${n.bat}%`
+              );
+            }
+          });
+          document.getElementById('nodes').innerHTML = html;
+        });
+        
+      fetch('/api/alerts')
+        .then(r => r.text())
+        .then(text => {
+          let lines = text.split('\n').slice(-10).reverse();
+          document.getElementById('alerts').innerHTML = lines.map(l => 
+            `<div class="alert">${l}</div>`
+          ).join('');
+        });
+    }
+    
+    function downloadData() {
+      window.location.href = '/api/download';
+    }
+    
+    function clearSD() {
+      if (confirm('Clear all data from SD card?')) {
+        fetch('/api/clear').then(() => alert('SD card cleared'));
+      }
+    }
+    
+    setInterval(refreshData, 5000);
+    refreshData();
+  </script>
+</body>
+</html>
+)rawliteral";
+}

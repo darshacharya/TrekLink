@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>LoRa Tracker Dashboard - Modern UI</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="stylesheet" href="leaflet/leaflet.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <!-- Header -->
+  <header class="header">
+    <div class="header-content">
+      <div class="logo">
+        <div class="logo-icon">L</div>
+        <div class="logo-text">LoRa Tracker Dashboard</div>
+      </div>
+      <div class="status-indicator">
+        <div class="status-dot"></div>
+        <span>System Online</span>
+      </div>
+    </div>
+  </header>
+
+  <!-- Map Container -->
+  <div id="map-container">
+    <div id="map"></div>
+    <button id="fullscreen-btn" title="Toggle Fullscreen Map">
+      <span>🔍</span>
+      <span>Fullscreen</span>
+    </button>
+  </div>
+
+  <!-- Alert Summary -->
+  <div id="alert-summary">
+    <div class="alert-banner">
+      <div class="alert-icon">!</div>
+      <span>Active alerts detected on devices</span>
+    </div>
+  </div>
+
+  <!-- Dashboard Container -->
+  <div class="dashboards-container">
+    <!-- Device P1 Dashboard -->
+    <div class="dashboard" id="dashboard-p1">
+      <div class="dashboard-header">
+        <div class="device-info">
+          <div class="device-avatar p1">P1</div>
+          <div class="device-details">
+            <h3>Device P1</h3>
+            <p>Primary Sensor Node</p>
+          </div>
+        </div>
+        <div class="connection-status online">Online</div>
+      </div>
+
+      <div class="metrics-grid">
+        <div class="metric-card">
+          <div class="metric-label">Temperature</div>
+          <div class="metric-value" id="temperature-p1">--<span class="metric-unit">°C</span></div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">Pressure</div>
+          <div class="metric-value" id="pressure-p1">--<span class="metric-unit">hPa</span></div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">Altitude</div>
+          <div class="metric-value" id="altitude-p1">--<span class="metric-unit">m</span></div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">Device ID</div>
+          <div class="metric-value" id="id-p1" style="font-size: 1.5rem;">--</div>
+        </div>
+      </div>
+
+      <div class="battery-card">
+        <div class="battery-header">
+          <div class="metric-label">Battery Level</div>
+          <div class="battery-percentage" id="battery-p1">--%</div>
+        </div>
+        <div class="battery-bar-container">
+          <div id="battery-fill-p1" class="battery-fill" style="width: 0%"></div>
+        </div>
+      </div>
+
+      <div class="alert-section">
+        <div id="alert-p1" class="alert-active" style="display:none;">
+          <div class="alert-icon-large">!</div>
+          <span>ALERT DETECTED</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Device P2 Dashboard -->
+    <div class="dashboard" id="dashboard-p2">
+      <div class="dashboard-header">
+        <div class="device-info">
+          <div class="device-avatar p2">P2</div>
+          <div class="device-details">
+            <h3>Device P2</h3>
+            <p>Secondary Sensor Node</p>
+          </div>
+        </div>
+        <div class="connection-status online">Online</div>
+      </div>
+
+      <div class="metrics-grid">
+        <div class="metric-card">
+          <div class="metric-label">Temperature</div>
+          <div class="metric-value" id="temperature-p2">--<span class="metric-unit">°C</span></div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">Pressure</div>
+          <div class="metric-value" id="pressure-p2">--<span class="metric-unit">hPa</span></div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">Altitude</div>
+          <div class="metric-value" id="altitude-p2">--<span class="metric-unit">m</span></div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">Device ID</div>
+          <div class="metric-value" id="id-p2" style="font-size: 1.5rem;">--</div>
+        </div>
+      </div>
+
+      <div class="battery-card">
+        <div class="battery-header">
+          <div class="metric-label">Battery Level</div>
+          <div class="battery-percentage" id="battery-p2">--%</div>
+        </div>
+        <div class="battery-bar-container">
+          <div id="battery-fill-p2" class="battery-fill" style="width: 0%"></div>
+        </div>
+      </div>
+
+      <div class="alert-section">
+        <div id="alert-p2" class="alert-active" style="display:none;">
+          <div class="alert-icon-large">!</div>
+          <span>ALERT DETECTED</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Alert Log -->
+  <div id="alert-log-container">
+    <div class="alert-log-card">
+      <div class="alert-log-header">
+        <div class="alert-log-icon">📋</div>
+        <div class="alert-log-title">Alert Log</div>
+      </div>
+      <ul id="alert-log"></ul>
+      <div id="log-empty">No alerts logged yet.</div>
+    </div>
+  </div>
+
+  <script src="leaflet/leaflet.js"></script>
+  <script src="script.js"></script>
+</body>
+</html>
+

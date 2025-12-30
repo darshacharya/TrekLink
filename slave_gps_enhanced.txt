@@ -1,0 +1,300 @@
+// Slave_GPS_Enhanced.ino
+// ESP32 + SX127x + BMP280/085 + Battery + LED + Button + GPS
+// Includes GPS tracking with Bangalore fallback coordinates
+
+#include <SPI.h>
+#include <LoRa.h>
+#include <Wire.h>
+#include <Adafruit_BMP280.h>
+#include <Adafruit_BMP085.h>
+#include <ArduinoJson.h>
+#include <TinyGPS++.h>
+#include <HardwareSerial.h>
+
+// ============ LORA PINS ============
+#define LORA_NSS   5
+#define LORA_RST   14
+#define LORA_DIO0  26
+#define LORA_SCK   18
+#define LORA_MISO  19
+#define LORA_MOSI  23
+#define LORA_FREQ  433E6
+
+// ============ GPIO PINS ============
+#define LED_PIN       25
+#define BUTTON_PIN    4
+#define BATTERY_PIN   34
+#define GPS_RX        16
+#define GPS_TX        17
+
+// ============ NODE CONFIG ============
+#define NODE_ID "NODE1"   // Change to "NODE1", "NODE2", or "NODE3"
+
+// ============ BATTERY CONFIG ============
+#define R1 150000.0
+#define R2 100000.0
+#define VREF 3.6
+#define ADC_MAX 4095.0
+#define BATT_FULL 8.4
+#define BATT_EMPTY 5.5
+#define ADC_SAMPLES 20
+#define VREF_CALIBRATION 1.0
+
+// ============ GPS CONFIG ============
+#define GPS_TIMEOUT 5000  // Wait 5 seconds for GPS fix
+#define FALLBACK_LAT 12.9716  // Bangalore
+#define FALLBACK_LNG 77.5946
+
+// Sea level pressure for altitude calculation
+#define SEA_LEVEL_PRESSURE 1013.25
+
+Adafruit_BMP280 bmp280;
+Adafruit_BMP085 bmp085;
+TinyGPSPlus gps;
+HardwareSerial GPS_Serial(1);
+
+bool haveBMP280 = false;
+bool haveBMP085 = false;
+bool alertFlag = false;
+bool blinking = false;
+unsigned long blinkStart = 0;
+const unsigned long BLINK_MS = 10000UL;
+
+// ============================================
+void setup() {
+  Serial.begin(115200);
+  while (!Serial && millis() < 2000) {}
+
+  Serial.println("\n=== LoRa Slave Node with GPS ===");
+  Serial.print("Node ID: ");
+  Serial.println(NODE_ID);
+
+  pinMode(LED_PIN, OUTPUT);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  pinMode(BATTERY_PIN, INPUT);
+
+  // Configure ADC
+  analogReadResolution(12);
+  analogSetAttenuation(ADC_11db);
+
+  // Initialize GPS
+  GPS_Serial.begin(9600, SERIAL_8N1, GPS_RX, GPS_TX);
+  Serial.println("GPS initialized");
+
+  // Initialize LoRa
+  SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_NSS);
+  LoRa.setPins(LORA_NSS, LORA_RST, LORA_DIO0);
+  
+  if (!LoRa.begin(LORA_FREQ)) {
+    Serial.println("LoRa init failed!");
+    while (true) {
+      digitalWrite(LED_PIN, !digitalRead(LED_PIN));
+      delay(200);
+    }
+  }
+  Serial.println("✓ LoRa init OK");
+
+  // Detect BMP sensor
+  Wire.begin();
+  if (bmp280.begin(0x76) || bmp280.begin(0x77)) {
+    haveBMP280 = true;
+    Serial.println("✓ Detected BMP280");
+  } else if (bmp085.begin()) {
+    haveBMP085 = true;
+    Serial.println("✓ Detected BMP085");
+  } else {
+    Serial.println("⚠ WARNING: No BMP sensor detected!");
+  }
+
+  Serial.println("=== Node Ready ===\n");
+  
+  // Startup blink
+  for (int i = 0; i < 3; i++) {
+    digitalWrite(LED_PIN, HIGH);
+    delay(100);
+    digitalWrite(LED_PIN, LOW);
+    delay(100);
+  }
+}
+
+// ============================================
+void loop() {
+  // Update GPS
+  while (GPS_Serial.available() > 0) {
+    gps.encode(GPS_Serial.read());
+  }
+
+  // Check button (with debounce)
+  static unsigned long lastButtonTime = 0;
+  if (digitalRead(BUTTON_PIN) == LOW && (millis() - lastButtonTime > 200)) {
+    alertFlag = true;
+    lastButtonTime = millis();
+    Serial.println("🚨 Button pressed -> alertFlag set");
+    digitalWrite(LED_PIN, HIGH);
+    delay(50);
+    digitalWrite(LED_PIN, LOW);
+  }
+
+  // Check for incoming LoRa packets
+  int packetSize = LoRa.parsePacket();
+  if (packetSize) {
+    String payload = "";
+    while (LoRa.available()) {
+      payload += (char)LoRa.read();
+    }
+    payload.trim();
+    
+    int rssi = LoRa.packetRssi();
+    float snr = LoRa.packetSnr();
+
+    Serial.print("[RX RSSI=");
+    Serial.print(rssi);
+    Serial.print(" SNR=");
+    Serial.print(snr);
+    Serial.print("] ");
+    Serial.println(payload);
+
+    // Handle master poll request
+    if (payload == String("REQ:") + NODE_ID) {
+      delay(random(50, 150)); // Random delay to avoid collisions
+      sendSensorData();
+    }
+    // Handle broadcast alert
+    else if (payload.startsWith("BROADCAST:ALERT")) {
+      startBlinking();
+    }
+  }
+
+  // Handle LED blinking (non-blocking)
+  if (blinking) {
+    unsigned long now = millis();
+    if (now - blinkStart < BLINK_MS) {
+      // Fast blink: 250ms period (4Hz)
+      digitalWrite(LED_PIN, ((now / 125) % 2) ? HIGH : LOW);
+    } else {
+      blinking = false;
+      digitalWrite(LED_PIN, LOW);
+      Serial.println("Blinking stopped");
+    }
+  }
+}
+
+// ============================================
+void sendSensorData() {
+  float temp = NAN;
+  float pres = NAN;
+  float alt = NAN;
+
+  // Read BMP sensor
+  if (haveBMP280) {
+    temp = bmp280.readTemperature();
+    pres = bmp280.readPressure() / 100.0;
+    alt = bmp280.readAltitude(SEA_LEVEL_PRESSURE);
+  } else if (haveBMP085) {
+    temp = bmp085.readTemperature();
+    pres = bmp085.readPressure() / 100.0;
+    alt = bmp085.readAltitude(SEA_LEVEL_PRESSURE * 100);
+  }
+
+  // Read battery percentage
+  float battPct = readBatteryPercent();
+
+  // Get GPS coordinates
+  float latitude = FALLBACK_LAT;
+  float longitude = FALLBACK_LNG;
+  bool gpsValid = false;
+
+  if (gps.location.isValid() && gps.location.age() < GPS_TIMEOUT) {
+    latitude = gps.location.lat();
+    longitude = gps.location.lng();
+    gpsValid = true;
+    Serial.print("📍 GPS: ");
+    Serial.print(latitude, 6);
+    Serial.print(", ");
+    Serial.print(longitude, 6);
+    Serial.print(" (Sats: ");
+    Serial.print(gps.satellites.value());
+    Serial.println(")");
+  } else {
+    Serial.println("📍 GPS: Using fallback (Bangalore)");
+  }
+
+  // Create JSON (compact format)
+  StaticJsonDocument<256> doc;
+  doc["node"] = NODE_ID;
+  doc["temp"] = isnan(temp) ? 0 : round(temp * 100) / 100.0;
+  doc["pres"] = isnan(pres) ? 0 : round(pres * 10) / 10.0;
+  doc["alt"] = isnan(alt) ? 0 : (int)round(alt);
+  doc["bat"] = (int)round(battPct);
+  doc["lat"] = latitude;
+  doc["lng"] = longitude;
+  doc["gps"] = gpsValid ? 1 : 0;
+  doc["alert"] = alertFlag ? 1 : 0;
+
+  String jsonStr;
+  serializeJson(doc, jsonStr);
+
+  // Send via LoRa
+  LoRa.beginPacket();
+  LoRa.print(jsonStr);
+  LoRa.endPacket();
+
+  Serial.print("📤 Sent -> ");
+  Serial.println(jsonStr);
+
+  // Blink LED to confirm send
+  digitalWrite(LED_PIN, HIGH);
+  delay(50);
+  digitalWrite(LED_PIN, LOW);
+
+  // Reset alert flag after sending
+  alertFlag = false;
+}
+
+// ============================================
+float readBatteryPercent() {
+  const int numReadings = 20;
+  int readings[numReadings];
+  
+  // Take multiple readings
+  for (int i = 0; i < numReadings; i++) {
+    readings[i] = analogRead(BATTERY_PIN);
+    delay(5);
+  }
+
+  // Sort for median filtering
+  for (int i = 0; i < numReadings - 1; i++) {
+    for (int j = i + 1; j < numReadings; j++) {
+      if (readings[i] > readings[j]) {
+        int temp = readings[i];
+        readings[i] = readings[j];
+        readings[j] = temp;
+      }
+    }
+  }
+
+  // Use median value
+  float adcValue = readings[numReadings / 2];
+  
+  // Calculate voltage
+  float vDivider = (adcValue / ADC_MAX) * VREF * VREF_CALIBRATION;
+  float vBatt = vDivider * ((R1 + R2) / R2);
+
+  // Clamp to battery range
+  if (vBatt > BATT_FULL) vBatt = BATT_FULL;
+  if (vBatt < BATT_EMPTY) vBatt = BATT_EMPTY;
+
+  // Calculate percentage
+  float percent = ((vBatt - BATT_EMPTY) / (BATT_FULL - BATT_EMPTY)) * 100.0;
+  if (percent > 100.0) percent = 100.0;
+  if (percent < 0.0) percent = 0.0;
+
+  return percent;
+}
+
+// ============================================
+void startBlinking() {
+  blinking = true;
+  blinkStart = millis();
+  Serial.println("🚨 ALERT broadcast received -> LED blinking for 10s");
+}

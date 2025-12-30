@@ -1,7 +1,11 @@
-// Slave_Enhanced.ino
-// ESP32 + SX127x + BMP280/085 + Battery Monitor + LED + Button
-// Author: Enhanced by Assistant
-// JSON format data transmission with altitude and battery percentage
+// ============================================================
+// Slave_Enhanced_Final.ino
+// ESP32 + SX127x + BMP280/085 + GPS + Battery Monitor + LED + Button
+// Author: Enhanced version by Assistant
+// Features:
+// - JSON LoRa telemetry: temperature, pressure, altitude, battery %, GPS lat/lon, alert flag
+// - ADC calibration & hysteresis to stabilize high-impedance battery readings
+// ============================================================
 
 #include <SPI.h>
 #include <LoRa.h>
@@ -9,8 +13,11 @@
 #include <Adafruit_BMP280.h>
 #include <Adafruit_BMP085.h>
 #include <ArduinoJson.h>
+#include <TinyGPSPlus.h>
+#include <HardwareSerial.h>
+#include "esp_adc_cal.h"
 
-// ============ LORA PINS ============
+// ================= LORA CONFIG =================
 #define LORA_NSS   5
 #define LORA_RST   14
 #define LORA_DIO0  26
@@ -19,41 +26,57 @@
 #define LORA_MOSI  23
 #define LORA_FREQ  433E6
 
-// ============ GPIO PINS ============
+// ================= GPIO PINS =================
 #define LED_PIN       25
 #define BUTTON_PIN    4
-#define BATTERY_PIN   34  // ADC1_CH6
+#define BATTERY_PIN   34
 
-// ============ NODE CONFIG ============
-#define NODE_ID "NODE3"   // Change to "NODE1", "NODE2", "NODE3"
+// ================= GPS CONFIG =================
+#define GPS_RX      16   // RX of ESP32 ← TX of GPS
+#define BUTTON_PIN    4
+#define BATTERY_PIN   34
 
-// ============ BATTERY CONFIG ============
-#define R1 150000.0  // 150k ohm (Brown Green Yellow)
-#define R2 100000.0  // 100k ohm (Brown Black Yellow)
-#define VREF 3.6     // ESP32 ADC reference at 11dB attenuation
-#define ADC_MAX 4095.0
-#define BATT_FULL 8.4    // 2S Li-ion fully charged
-#define BATT_EMPTY 5.5   // 2S Li-ion empty (adjust based on your usage)
-#define ADC_SAMPLES 20   // More samples for stability
+// ================= GPS CONFIG =================
+#define GPS_RX      16   // RX of ESP32 ← TX of GPS
+#define GPS_TX      17   // TX of ESP32 → RX of GPS
 
-// Calibration factor (fine-tune if needed after testing)
+// ================= NODE CONFIG =================
+#define NODE_ID "NODE3"
+
+
+
+#define GPS_TX      17   // TX of ESP32 → RX of GPS
+
+// ================= NODE CONFIG =================
+#define NODE_ID "NODE3"
+
+// ================= BATTERY CONFIG =================
+#define R1 150000.0
+#define R2 100000.0
 #define VREF_CALIBRATION 1.0
+#define BATT_FULL 8.4
+#define BATT_EMPTY 5.5
+#define DEFAULT_VREF 1100  // mV, internal reference for ESP32 ADC
 
-// Sea level pressure for altitude calculation
+// ================= SENSOR CONFIG =================
 #define SEA_LEVEL_PRESSURE 1013.25
 
+// ================= OBJECTS =================
 Adafruit_BMP280 bmp280;
 Adafruit_BMP085 bmp085;
+TinyGPSPlus gps;
+HardwareSerial GPSSerial(1);
+esp_adc_cal_characteristics_t *adc_chars;
 
+// ================= FLAGS =================
 bool haveBMP280 = false;
 bool haveBMP085 = false;
-
 bool alertFlag = false;
 bool blinking = false;
 unsigned long blinkStart = 0;
 const unsigned long BLINK_MS = 10000UL;
 
-// ============================================
+// ============================================================
 void setup() {
   Serial.begin(115200);
   while (!Serial && millis() < 2000) {}
@@ -62,14 +85,20 @@ void setup() {
   pinMode(BUTTON_PIN, INPUT_PULLUP);
   pinMode(BATTERY_PIN, INPUT);
 
-  // Configure ADC for better accuracy
   analogReadResolution(12);
-  analogSetAttenuation(ADC_11db);  // 0-3.6V range (with non-linearity above 3.1V)
+  analogSetAttenuation(ADC_11db);
 
-  // Initialize LoRa
+  // --- Initialize ADC calibration ---
+  setup_adc_cal();
+
+  // --- Initialize GPS ---
+  GPSSerial.begin(9600, SERIAL_8N1, GPS_RX, GPS_TX);
+  Serial.println("GPS initialized at 9600 baud");
+
+  // --- Initialize LoRa ---
   SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_NSS);
   LoRa.setPins(LORA_NSS, LORA_RST, LORA_DIO0);
-  
+
   if (!LoRa.begin(LORA_FREQ)) {
     Serial.println("LoRa init failed!");
     while (true) {
@@ -79,7 +108,7 @@ void setup() {
   }
   Serial.println("LoRa init OK");
 
-  // Detect BMP sensor
+  // --- Detect BMP Sensor ---
   Wire.begin();
   if (bmp280.begin(0x76) || bmp280.begin(0x77)) {
     haveBMP280 = true;
@@ -94,8 +123,7 @@ void setup() {
   Serial.print("Node ");
   Serial.print(NODE_ID);
   Serial.println(" ready");
-  
-  // Startup blink
+
   for (int i = 0; i < 3; i++) {
     digitalWrite(LED_PIN, HIGH);
     delay(100);
@@ -104,9 +132,14 @@ void setup() {
   }
 }
 
-// ============================================
+// ============================================================
 void loop() {
-  // 1) Check button (with debounce)
+  // --- Feed GPS parser ---
+  while (GPSSerial.available() > 0) {
+    gps.encode(GPSSerial.read());
+  }
+
+  // --- Check button press (debounced) ---
   static unsigned long lastButtonTime = 0;
   if (digitalRead(BUTTON_PIN) == LOW && (millis() - lastButtonTime > 200)) {
     alertFlag = true;
@@ -117,15 +150,13 @@ void loop() {
     digitalWrite(LED_PIN, LOW);
   }
 
-  // 2) Check for incoming LoRa packets
+  // --- Handle incoming LoRa packets ---
   int packetSize = LoRa.parsePacket();
   if (packetSize) {
     String payload = "";
-    while (LoRa.available()) {
-      payload += (char)LoRa.read();
-    }
+    while (LoRa.available()) payload += (char)LoRa.read();
     payload.trim();
-    
+
     int rssi = LoRa.packetRssi();
     float snr = LoRa.packetSnr();
 
@@ -136,22 +167,18 @@ void loop() {
     Serial.print("] ");
     Serial.println(payload);
 
-    // Handle master poll request
     if (payload == String("REQ:") + NODE_ID) {
-      delay(random(50, 150)); // Random delay to avoid collisions
+      delay(random(50, 150));  // collision avoidance
       sendSensorData();
-    }
-    // Handle broadcast alert
-    else if (payload.startsWith("BROADCAST:ALERT")) {
+    } else if (payload.startsWith("BROADCAST:ALERT")) {
       startBlinking();
     }
   }
 
-  // 3) Handle LED blinking (non-blocking)
+  // --- LED blinking (non-blocking) ---
   if (blinking) {
     unsigned long now = millis();
     if (now - blinkStart < BLINK_MS) {
-      // Fast blink: 250ms period (4Hz)
       digitalWrite(LED_PIN, ((now / 125) % 2) ? HIGH : LOW);
     } else {
       blinking = false;
@@ -161,40 +188,39 @@ void loop() {
   }
 }
 
-// ============================================
-// Read all sensors and send JSON data
+// ============================================================
+// Send sensor data as JSON
 void sendSensorData() {
-  float temp = NAN;
-  float pres = NAN;
-  float alt = NAN;
+  float temp = NAN, pres = NAN, alt = NAN;
 
-  // Read BMP sensor
   if (haveBMP280) {
     temp = bmp280.readTemperature();
-    pres = bmp280.readPressure() / 100.0; // Convert Pa to hPa
+    pres = bmp280.readPressure() / 100.0;
     alt = bmp280.readAltitude(SEA_LEVEL_PRESSURE);
   } else if (haveBMP085) {
     temp = bmp085.readTemperature();
     pres = bmp085.readPressure() / 100.0;
-    alt = bmp085.readAltitude(SEA_LEVEL_PRESSURE * 100); // Needs Pa
+    alt = bmp085.readAltitude(SEA_LEVEL_PRESSURE * 100);
   }
 
-  // Read battery percentage
   float battPct = readBatteryPercent();
 
-  // Create JSON (compact format)
-  StaticJsonDocument<128> doc;
+  double lat = gps.location.isValid() ? gps.location.lat() : 0.0;
+  double lon = gps.location.isValid() ? gps.location.lng() : 0.0;
+
+  StaticJsonDocument<192> doc;
   doc["node"] = NODE_ID;
   doc["temp"] = isnan(temp) ? 0 : round(temp * 100) / 100.0;
   doc["pres"] = isnan(pres) ? 0 : round(pres * 10) / 10.0;
-  doc["alt"] = isnan(alt) ? 0 : (int)round(alt);
-  doc["bat"] = (int)round(battPct);
+  doc["alt"]  = isnan(alt)  ? 0 : (int)round(alt);
+  doc["bat"]  = (int)round(battPct);
   doc["alert"] = alertFlag ? 1 : 0;
+  doc["lat"]  = lat;
+  doc["lon"]  = lon;
 
   String jsonStr;
   serializeJson(doc, jsonStr);
 
-  // Send via LoRa
   LoRa.beginPacket();
   LoRa.print(jsonStr);
   LoRa.endPacket();
@@ -202,53 +228,68 @@ void sendSensorData() {
   Serial.print("Sent -> ");
   Serial.println(jsonStr);
 
-  // Reset alert flag after sending
   alertFlag = false;
 }
 
-// ============================================
-// Read battery voltage and calculate percentage
+// ============================================================
+// Initialize ADC calibration
+void setup_adc_cal() {
+  adc_chars = (esp_adc_cal_characteristics_t*)calloc(1, sizeof(esp_adc_cal_characteristics_t));
+  esp_adc_cal_characterize(ADC_UNIT_1, ADC_ATTEN_DB_11, ADC_WIDTH_BIT_12, DEFAULT_VREF, adc_chars);
+}
 
+// ============================================================
+// Read and stabilize battery voltage
 float readBatteryPercent() {
-  const int numReadings = 20;
+  const int numReadings = 50;
   int readings[numReadings];
-  
-  // Take readings
+
+  // take multiple readings
   for (int i = 0; i < numReadings; i++) {
     readings[i] = analogRead(BATTERY_PIN);
-    delay(5); // Short delay between samples
+    delay(3);
   }
 
-  // Sort for median
+  // sort for median
   for (int i = 0; i < numReadings - 1; i++) {
     for (int j = i + 1; j < numReadings; j++) {
       if (readings[i] > readings[j]) {
-        int temp = readings[i];
+        int t = readings[i];
         readings[i] = readings[j];
-        readings[j] = temp;
+        readings[j] = t;
       }
     }
   }
 
-  // Use median (middle value)
-  float adcValue = readings[numReadings / 2];
-  
-  // Rest of your voltage calculation...
-  float vDivider = (adcValue / ADC_MAX) * 3.6 * VREF_CALIBRATION;
-  float vBatt = vDivider * ((R1 + R2) / R2);
+  int mid = numReadings / 2;
+  int median = readings[mid];
+  float avg = (readings[mid - 1] + median + readings[mid + 1]) / 3.0;
 
-  // Clamp and calculate percent (same as before)
-  if (vBatt > 8.4) vBatt = 8.4;
-  if (vBatt < 5.5) vBatt = 5.5;
+  uint32_t mv = esp_adc_cal_raw_to_voltage((uint32_t)avg, adc_chars);
+  float vDivider = (mv / 1000.0);
+  float vBatt = vDivider * ((R1 + R2) / R2) * VREF_CALIBRATION;
+
+  if (vBatt > BATT_FULL) vBatt = BATT_FULL;
+  if (vBatt < BATT_EMPTY) vBatt = BATT_EMPTY;
 
   float percent = ((vBatt - BATT_EMPTY) / (BATT_FULL - BATT_EMPTY)) * 100.0;
   if (percent > 100.0) percent = 100.0;
   if (percent < 0.0) percent = 0.0;
 
+  // add hysteresis
+  static float lastPercent = -1.0;
+  if (lastPercent < 0) lastPercent = percent;
+  if (fabs(percent - lastPercent) < 1.0) {
+    percent = lastPercent;
+  } else {
+    lastPercent = percent;
+  }
+
   return percent;
 }
 
-// ============================================
+// ============================================================
+// Start LED blinking for alert
 void startBlinking() {
   blinking = true;
   blinkStart = millis();

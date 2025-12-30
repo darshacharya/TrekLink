@@ -1,40 +1,71 @@
-// // Master_Enhanced.ino
-// ESP32 + SX127x + SD Card + Buzzer
-// Polls slaves, logs JSON data to SD card, handles alerts
-// Author: Enhanced by Assistant
+// ============================================================
+// Master_Enhanced.ino - SPIFFS Version (No SD Card Required!)
+// ESP32 + SX127x + Internal Flash Logging + Buzzer + LED Alert
+// Polls slaves, logs JSON data to internal flash, handles alerts
+// ============================================================
+//
+// HARDWARE CONNECTIONS:
+// ============================================================
+//
+// LoRa SX127x Module (VSPI):
+//   NSS/CS   -> GPIO 5
+//   RST      -> GPIO 14
+//   DIO0     -> GPIO 26
+//   SCK      -> GPIO 18
+//   MISO     -> GPIO 19
+//   MOSI     -> GPIO 23
+//   VCC      -> 3.3V
+//   GND      -> GND
+//
+// Buzzer & LED:
+//   BUZZER   -> GPIO 21 (active buzzer, with GND)
+//   LED      -> GPIO 22 (with 220Ω resistor to GND)
+//
+// NO SD CARD NEEDED! Uses internal ESP32 flash storage (SPIFFS)
+//
+// IMPORTANT:
+// - Go to Tools > Partition Scheme > "Default 4MB with spiffs"
+// - First upload: Use Tools > ESP32 Sketch Data Upload (to format SPIFFS)
+//   OR the code will auto-format on first run
+//
+// ============================================================
 
 #include <SPI.h>
 #include <LoRa.h>
-#include <SD.h>
+#include <SPIFFS.h>  // Internal flash file system
 #include <ArduinoJson.h>
 
-// ============ LORA PINS ============
-#define LORA_NSS    5
-#define LORA_RST    14
-#define LORA_DIO0   26
-#define LORA_SCK    18
-#define LORA_MISO   19
-#define LORA_MOSI   23
+// ---------- LORA (VSPI) ----------
+#define LORA_NSS   5
+#define LORA_RST   14
+#define LORA_DIO0  26
+#define LORA_SCK   18
+#define LORA_MISO  19
+#define LORA_MOSI  23
 
-// ============ SD CARD PINS ============
-#define SD_CS       15    // Chip Select for SD card
+// ---------- ALERT HARDWARE ----------
+#define BUZZER_PIN 21
+#define LED_PIN    22
 
-// ============ OTHER PINS ============
-#define BUZZER_PIN  27    // Active buzzer
-
-// ============ NODE CONFIG ============
+// ---------- NODES ----------
 const String nodes[] = {"NODE1", "NODE2", "NODE3"};
 const int NODE_COUNT = sizeof(nodes) / sizeof(nodes[0]);
 
-// ============ TIMING CONFIG ============
-#define POLL_INTERVAL     3000    // 3 seconds between polls
-#define RESPONSE_TIMEOUT  1500    // Wait 1.5s for slave reply
-#define MAX_RETRIES       2       // Retry twice before skip
+// ---------- TIMING ----------
+#define POLL_INTERVAL     3000
+#define RESPONSE_TIMEOUT  1500
+#define MAX_RETRIES       2
 
-// ============ BUZZER CONFIG ============
+// ---------- ALERT SETTINGS ----------
 #define ALERT_BEEP_COUNT  3
 #define ALERT_BEEP_MS     200
 #define BUTTON_BEEP_MS    100
+#define LED_BLINK_MS      300
+#define LED_ALERT_DURATION 5000
+
+// ---------- LOGGING SETTINGS ----------
+#define MAX_LOG_SIZE      500000  // 500KB max log size
+#define LOG_BUFFER_SIZE   10      // Buffer N entries before writing
 
 struct NodeState {
   bool awaiting = false;
@@ -45,126 +76,141 @@ struct NodeState {
 NodeState nodeState[NODE_COUNT];
 int currentIndex = 0;
 unsigned long lastPollCycle = 0;
+
 bool alertPending = false;
+bool ledBlinking = false;
+unsigned long ledBlinkStart = 0;
+unsigned long lastLedToggle = 0;
 
-bool sdCardOK = false;
+bool storageOK = false;
 String logFileName = "/data.txt";
+String logBuffer = "";
+int bufferCount = 0;
 
-// ============================================
+// ============================================================
 void setup() {
   Serial.begin(115200);
   delay(1000);
-  Serial.println("\n=== LoRa Master Node ===");
+  Serial.println("\n╔════════════════════════════════╗");
+  Serial.println("║   LoRa Master Node v3.0        ║");
+  Serial.println("║   (SPIFFS Internal Storage)    ║");
+  Serial.println("╚════════════════════════════════╝\n");
 
+  // ---------------- GPIO Setup ----------------
   pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(LED_PIN, OUTPUT);
   digitalWrite(BUZZER_PIN, LOW);
+  digitalWrite(LED_PIN, LOW);
 
-  // Startup beep
   beep(BUTTON_BEEP_MS);
   delay(100);
   beep(BUTTON_BEEP_MS);
+  delay(200);
 
-  // Initialize LoRa
+  // ---------------- LoRa Init ----------------
+  Serial.println("→ Initializing LoRa...");
   SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_NSS);
   LoRa.setPins(LORA_NSS, LORA_RST, LORA_DIO0);
 
   if (!LoRa.begin(433E6)) {
-    Serial.println("ERROR: LoRa init failed!");
-    while (1) {
+    Serial.println("❌ LoRa init failed!");
+    while (true) {
       beep(50);
-      delay(500);
+      delay(400);
     }
   }
-  Serial.println("✓ LoRa initialized");
+  
+  LoRa.setSpreadingFactor(7);
+  LoRa.setSignalBandwidth(125E3);
+  LoRa.setSyncWord(0x12);
+  
+  Serial.println("✓ LoRa initialized (433MHz)\n");
 
-  // Initialize SD Card (shared SPI bus)
-  if (!SD.begin(SD_CS)) {
-    Serial.println("WARNING: SD Card init failed!");
-    Serial.println("Data logging disabled.");
-    sdCardOK = false;
+  // ---------------- SPIFFS Init ----------------
+  Serial.println("→ Initializing internal storage (SPIFFS)...");
+  
+  if (!SPIFFS.begin(true)) {  // true = format if mount fails
+    Serial.println("❌ SPIFFS mount failed!");
+    Serial.println("   Logging DISABLED\n");
+    storageOK = false;
+    beep(50);
+    delay(100);
+    beep(50);
   } else {
-    sdCardOK = true;
-    Serial.println("✓ SD Card initialized");
+    storageOK = true;
+    Serial.println("✓ SPIFFS mounted successfully");
     
-    uint8_t cardType = SD.cardType();
-    if (cardType == CARD_NONE) {
-      Serial.println("No SD card attached");
-      sdCardOK = false;
+    size_t totalBytes = SPIFFS.totalBytes();
+    size_t usedBytes = SPIFFS.usedBytes();
+    
+    Serial.printf("  Total: %u bytes (%.1f KB)\n", totalBytes, totalBytes/1024.0);
+    Serial.printf("  Used:  %u bytes (%.1f KB)\n", usedBytes, usedBytes/1024.0);
+    Serial.printf("  Free:  %u bytes (%.1f KB)\n", totalBytes-usedBytes, (totalBytes-usedBytes)/1024.0);
+    
+    // Check if log file exists
+    if (!SPIFFS.exists(logFileName)) {
+      writeLogHeader();
+      Serial.println("  Created new log file");
     } else {
-      Serial.print("SD Card Type: ");
-      if (cardType == CARD_MMC) Serial.println("MMC");
-      else if (cardType == CARD_SD) Serial.println("SDSC");
-      else if (cardType == CARD_SDHC) Serial.println("SDHC");
-      
-      uint64_t cardSize = SD.cardSize() / (1024 * 1024);
-      Serial.printf("SD Card Size: %lluMB\n", cardSize);
-      
-      // Write header if file doesn't exist
-      if (!SD.exists(logFileName)) {
-        writeLogHeader();
+      File f = SPIFFS.open(logFileName, "r");
+      if (f) {
+        Serial.printf("  Existing log: %u bytes\n", f.size());
+        f.close();
       }
     }
+    Serial.println();
+    beep(BUTTON_BEEP_MS);
   }
 
-  Serial.println("=== Master Ready ===\n");
+  // ---------------- Ready ----------------
+  Serial.println("╔════════════════════════════════╗");
+  Serial.println("║   System Ready - Polling...    ║");
+  Serial.println("╚════════════════════════════════╝\n");
+  
+  beep(BUTTON_BEEP_MS);
+  delay(100);
   beep(BUTTON_BEEP_MS);
 }
 
-// ============================================
+// ============================================================
 void loop() {
   unsigned long now = millis();
 
-  // Handle incoming LoRa packets
+  // ---- Handle incoming packets ----
   int packetSize = LoRa.parsePacket();
   if (packetSize) {
-    String incoming = "";
+    String incoming;
     while (LoRa.available()) {
       incoming += (char)LoRa.read();
     }
     incoming.trim();
 
-    if (incoming.length() > 0) {
+    if (incoming.length()) {
       int rssi = LoRa.packetRssi();
       float snr = LoRa.packetSnr();
-      
-      Serial.print("[RX RSSI=");
-      Serial.print(rssi);
-      Serial.print(" SNR=");
-      Serial.print(snr);
-      Serial.print("] ");
-      Serial.println(incoming);
-      
+
+      Serial.printf("📡 [RX] RSSI=%d dBm, SNR=%.1f dB\n", rssi, snr);
       handleIncoming(incoming, rssi, snr);
     }
   }
 
-  // Poll next node when ready
-  if (!nodeState[currentIndex].awaiting &&
-      (now - lastPollCycle >= POLL_INTERVAL)) {
+  // ---- Poll cycle ----
+  if (!nodeState[currentIndex].awaiting && (now - lastPollCycle >= POLL_INTERVAL)) {
     lastPollCycle = now;
     pollNode(currentIndex);
   }
 
-  // Handle timeouts
+  // ---- Timeout handling ----
   for (int i = 0; i < NODE_COUNT; i++) {
-    if (nodeState[i].awaiting &&
-        (now - nodeState[i].lastSend > RESPONSE_TIMEOUT)) {
-      
-      Serial.print("⏱ Timeout: ");
-      Serial.println(nodes[i]);
-      
+    if (nodeState[i].awaiting && (now - nodeState[i].lastSend > RESPONSE_TIMEOUT)) {
+      Serial.printf("⏱  Timeout: %s\n", nodes[i].c_str());
       nodeState[i].retries++;
 
       if (nodeState[i].retries < MAX_RETRIES) {
-        Serial.print("🔄 Retry ");
-        Serial.print(nodes[i]);
-        Serial.print(" (");
-        Serial.print(nodeState[i].retries);
-        Serial.println(")");
+        Serial.printf("🔄 Retry %s (%d/%d)\n", nodes[i].c_str(), nodeState[i].retries, MAX_RETRIES);
         pollNode(i);
       } else {
-        Serial.print("❌ Skipping ");
-        Serial.println(nodes[i]);
+        Serial.printf("❌ %s unreachable\n\n", nodes[i].c_str());
         logTimeout(nodes[i]);
         nodeState[i].awaiting = false;
         nodeState[i].retries = 0;
@@ -173,17 +219,29 @@ void loop() {
     }
   }
 
-  // Handle alert broadcast
+  // ---- Handle alert broadcast ----
   if (alertPending) {
     broadcastAlert();
     alertPending = false;
   }
+
+  // ---- LED blinking ----
+  if (ledBlinking) {
+    if (now - ledBlinkStart < LED_ALERT_DURATION) {
+      if (now - lastLedToggle >= LED_BLINK_MS) {
+        digitalWrite(LED_PIN, !digitalRead(LED_PIN));
+        lastLedToggle = now;
+      }
+    } else {
+      ledBlinking = false;
+      digitalWrite(LED_PIN, LOW);
+    }
+  }
 }
 
-// ============================================
+// ============================================================
 void pollNode(int index) {
   String req = "REQ:" + nodes[index];
-  
   LoRa.beginPacket();
   LoRa.print(req);
   LoRa.endPacket();
@@ -191,166 +249,192 @@ void pollNode(int index) {
   nodeState[index].awaiting = true;
   nodeState[index].lastSend = millis();
 
-  Serial.print("📤 Poll -> ");
-  Serial.println(req);
+  Serial.printf("📤 Poll → %s\n", nodes[index].c_str());
 }
 
-// ============================================
+// ============================================================
 void handleIncoming(const String &payload, int rssi, float snr) {
-  // Check if it's JSON data
-  if (payload.startsWith("{") && payload.endsWith("}")) {
-    
-    StaticJsonDocument<256> doc;
-    DeserializationError error = deserializeJson(doc, payload);
-
-    if (error) {
-      Serial.print("JSON parse error: ");
-      Serial.println(error.c_str());
-      return;
-    }
-
-    // Extract node ID
-    const char* nodeId = doc["node"];
-    if (nodeId == nullptr) {
-      Serial.println("Missing 'node' field in JSON");
-      return;
-    }
-
-    // Mark node as responded
-    for (int i = 0; i < NODE_COUNT; i++) {
-      if (nodes[i] == String(nodeId)) {
-        nodeState[i].awaiting = false;
-        nodeState[i].retries = 0;
-        break;
-      }
-    }
-
-    // Display parsed data
-    Serial.println("━━━━━━━━━━━━━━━━━━━━━━");
-    Serial.print("Node: ");
-    Serial.println(nodeId);
-    Serial.print("Temp: ");
-    Serial.print(doc["temp"].as<float>());
-    Serial.println(" °C");
-    Serial.print("Pressure: ");
-    Serial.print(doc["pres"].as<float>());
-    Serial.println(" hPa");
-    Serial.print("Altitude: ");
-    Serial.print(doc["alt"].as<int>());
-    Serial.println(" m");
-    Serial.print("Battery: ");
-    Serial.print(doc["bat"].as<int>());
-    Serial.println(" %");
-    Serial.print("Alert: ");
-    Serial.println(doc["alert"].as<int>());
-    Serial.println("━━━━━━━━━━━━━━━━━━━━━━");
-
-    // Log to SD card
-    logData(payload, nodeId, rssi, snr);
-
-    // Check for alert
-    if (doc["alert"].as<int>() == 1) {
-      Serial.println("⚠️ ALERT FLAG DETECTED!");
-      beep(BUTTON_BEEP_MS);
-      delay(100);
-      beep(BUTTON_BEEP_MS);
-      alertPending = true;
-    }
-
-    // Move to next node
-    currentIndex = (currentIndex + 1) % NODE_COUNT;
+  if (!payload.startsWith("{") || !payload.endsWith("}")) {
+    Serial.println("⚠️  Non-JSON message\n");
+    return;
   }
-  else {
-    Serial.print("Non-JSON message: ");
-    Serial.println(payload);
+
+  StaticJsonDocument<256> doc;
+  DeserializationError error = deserializeJson(doc, payload);
+  
+  if (error) {
+    Serial.printf("⚠️  JSON parse failed: %s\n\n", error.c_str());
+    return;
   }
+
+  const char* nodeId = doc["node"];
+  if (!nodeId) {
+    Serial.println("⚠️  Missing 'node' field\n");
+    return;
+  }
+
+  // Mark node as responded
+  for (int i = 0; i < NODE_COUNT; i++) {
+    if (nodes[i] == nodeId) {
+      nodeState[i].awaiting = false;
+      nodeState[i].retries = 0;
+      break;
+    }
+  }
+
+  // Display data
+  Serial.println("┌────────────────────────────────┐");
+  Serial.printf("│ Node:      %-19s │\n", nodeId);
+  Serial.printf("│ Temp:      %.2f °C             │\n", doc["temp"].as<float>());
+  Serial.printf("│ Pressure:  %.2f hPa           │\n", doc["pres"].as<float>());
+  Serial.printf("│ Altitude:  %d m                │\n", doc["alt"].as<int>());
+  Serial.printf("│ Battery:   %d %%                │\n", doc["bat"].as<int>());
+  Serial.printf("│ Alert:     %s                  │\n", doc["alert"].as<int>() ? "YES ⚠️ " : "No");
+  Serial.println("└────────────────────────────────┘");
+
+  // Log to internal storage
+  logData(payload, nodeId, rssi, snr);
+
+  // Alert handling
+  if (doc["alert"].as<int>() == 1) {
+    Serial.println("\n🚨 ⚠️  ALERT FLAG DETECTED! ⚠️  🚨\n");
+    alertPending = true;
+    ledBlinking = true;
+    ledBlinkStart = millis();
+    lastLedToggle = millis();
+  }
+
+  currentIndex = (currentIndex + 1) % NODE_COUNT;
+  Serial.println();
 }
 
-// ============================================
+// ============================================================
 void broadcastAlert() {
-  Serial.println("\n🚨 BROADCASTING ALERT TO ALL NODES 🚨");
-  
-  // Alert beeps
+  Serial.println("╔════════════════════════════════╗");
+  Serial.println("║  🚨 BROADCASTING ALERT 🚨      ║");
+  Serial.println("╚════════════════════════════════╝");
+
   for (int i = 0; i < ALERT_BEEP_COUNT; i++) {
     beep(ALERT_BEEP_MS);
     delay(ALERT_BEEP_MS);
   }
 
-  // Send broadcast
   LoRa.beginPacket();
   LoRa.print("BROADCAST:ALERT");
   LoRa.endPacket();
-  
+
   Serial.println("Alert broadcast sent\n");
 }
 
-// ============================================
+// ============================================================
 void beep(int duration) {
   digitalWrite(BUZZER_PIN, HIGH);
   delay(duration);
   digitalWrite(BUZZER_PIN, LOW);
 }
 
-// ============================================
+// ============================================================
 void writeLogHeader() {
-  File file = SD.open(logFileName, FILE_WRITE);
+  if (!storageOK) return;
+  
+  File file = SPIFFS.open(logFileName, "w");
   if (file) {
-    file.println("=== LoRa Sensor Network Data Log ===");
+    file.println("===========================================");
+    file.println("     LoRa Sensor Network Data Log");
+    file.println("===========================================");
     file.println("Timestamp,NodeID,Temp,Pressure,Altitude,Battery,Alert,RSSI,SNR,JSON");
     file.close();
-    Serial.println("Log header written");
-  } else {
-    Serial.println("Failed to write log header");
   }
 }
 
-// ============================================
+// ============================================================
 void logData(const String &jsonStr, const String &nodeId, int rssi, float snr) {
-  if (!sdCardOK) return;
+  if (!storageOK) {
+    Serial.println("⚠️  Logging skipped (storage unavailable)");
+    return;
+  }
 
   StaticJsonDocument<256> doc;
   deserializeJson(doc, jsonStr);
 
-  File file = SD.open(logFileName, FILE_APPEND);
+  // Build CSV line
+  String csvLine = String(millis()) + "," +
+                   nodeId + "," +
+                   String(doc["temp"].as<float>(), 2) + "," +
+                   String(doc["pres"].as<float>(), 2) + "," +
+                   String(doc["alt"].as<int>()) + "," +
+                   String(doc["bat"].as<int>()) + "," +
+                   String(doc["alert"].as<int>()) + "," +
+                   String(rssi) + "," +
+                   String(snr, 1) + "," +
+                   jsonStr;
+
+  // Add to buffer
+  logBuffer += csvLine + "\n";
+  bufferCount++;
+
+  // Write buffer when full or check file size
+  if (bufferCount >= LOG_BUFFER_SIZE) {
+    flushLogBuffer();
+    checkLogSize();
+  }
+
+  Serial.println("💾 Data logged to flash");
+}
+
+// ============================================================
+void flushLogBuffer() {
+  if (!storageOK || logBuffer.length() == 0) return;
+
+  File file = SPIFFS.open(logFileName, "a");
   if (file) {
-    // Timestamp (millis since boot)
-    file.print(millis());
-    file.print(",");
-    file.print(nodeId);
-    file.print(",");
-    file.print(doc["temp"].as<float>());
-    file.print(",");
-    file.print(doc["pres"].as<float>());
-    file.print(",");
-    file.print(doc["alt"].as<int>());
-    file.print(",");
-    file.print(doc["bat"].as<int>());
-    file.print(",");
-    file.print(doc["alert"].as<int>());
-    file.print(",");
-    file.print(rssi);
-    file.print(",");
-    file.print(snr);
-    file.print(",");
-    file.println(jsonStr);
+    file.print(logBuffer);
     file.close();
-    
-    Serial.println("✓ Logged to SD");
+    logBuffer = "";
+    bufferCount = 0;
   } else {
-    Serial.println("❌ SD write failed");
+    Serial.println("❌ Flash write failed");
   }
 }
 
-// ============================================
-void logTimeout(const String &nodeId) {
-  if (!sdCardOK) return;
+// ============================================================
+void checkLogSize() {
+  if (!storageOK) return;
 
-  File file = SD.open(logFileName, FILE_APPEND);
+  File file = SPIFFS.open(logFileName, "r");
   if (file) {
-    file.print(millis());
-    file.print(",");
-    file.print(nodeId);
-    file.println(",TIMEOUT,,,,,,,");
+    size_t fileSize = file.size();
     file.close();
+
+    // If file too large, archive it
+    if (fileSize > MAX_LOG_SIZE) {
+      Serial.println("⚠️  Log file too large, archiving...");
+      
+      // Delete old archive if exists
+      if (SPIFFS.exists("/data_old.txt")) {
+        SPIFFS.remove("/data_old.txt");
+      }
+      
+      // Rename current to old
+      SPIFFS.rename(logFileName, "/data_old.txt");
+      
+      // Create new log
+      writeLogHeader();
+      
+      Serial.println("✓ Log rotated");
+    }
+  }
+}
+
+// ============================================================
+void logTimeout(const String &nodeId) {
+  if (!storageOK) return;
+
+  String csvLine = String(millis()) + "," + nodeId + ",TIMEOUT,,,,,,,";
+  logBuffer += csvLine + "\n";
+  bufferCount++;
+
+  if (bufferCount >= LOG_BUFFER_SIZE) {
+    flushLogBuffer();
   }
 }

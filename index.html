@@ -1,0 +1,471 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LoRaWAN Dashboard (Fixed Scroll)</title>
+    
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <link href="https://fonts.googleapis.com/icon?family=Material+Icons+Round" rel="stylesheet">
+
+    <style>
+        :root {
+            --bg-app: #f8fafc;
+            --panel-bg: #ffffff;     
+            --border-color: #e2e8f0;
+            --primary: #3b82f6;
+            --accent: #f59e0b;
+            --danger: #ef4444;
+            --text-main: #0f172a;
+            --text-muted: #64748b;
+        }
+
+        body {
+            margin: 0;
+            background: var(--bg-app);
+            color: var(--text-main);
+            font-family: 'Inter', sans-serif;
+            height: 100vh;
+            overflow: hidden;
+            display: grid;
+            grid-template-columns: 320px 1fr 340px;
+        }
+
+        /* --- LEFT SIDEBAR (Fixed Scroll Issue Here) --- */
+        .sidebar {
+            background: var(--panel-bg);
+            border-right: 1px solid var(--border-color);
+            padding: 20px;
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
+            z-index: 20;
+            height: 100vh;      /* Force full height */
+            box-sizing: border-box; /* Include padding in height calc */
+            overflow: hidden;   /* Prevent sidebar itself from scrolling */
+        }
+
+        .console-wrapper {
+            flex: 1;            /* Take remaining space */
+            display: flex;
+            flex-direction: column;
+            min-height: 0;      /* CRITICAL FIX: Allows flex child to shrink */
+        }
+
+        .console {
+            background: #1e293b; 
+            color: #cbd5e1;
+            border-radius: 8px;
+            padding: 12px;
+            font-family: 'Courier New', monospace;
+            font-size: 0.75rem;
+            flex: 1;            /* Fill wrapper */
+            overflow-y: auto;   /* Scroll ONLY this element */
+            border: 1px solid #334155;
+        }
+
+        .log-entry { margin-bottom: 4px; border-left: 3px solid transparent; padding-left: 6px; line-height: 1.4; }
+
+        /* --- Main Stage --- */
+        .main-stage {
+            position: relative;
+            background: #e2e8f0;
+        }
+
+        /* --- Right Panel --- */
+        .telemetry-panel {
+            background: var(--panel-bg);
+            border-left: 1px solid var(--border-color);
+            padding: 20px;
+            overflow-y: auto;
+            z-index: 20;
+            height: 100vh;
+            box-sizing: border-box;
+        }
+
+        /* --- Map & Nodes --- */
+        #map { width: 100%; height: 100%; z-index: 1; }
+        
+        .map-node {
+            background: #ffffff;
+            border: 2px solid #94a3b8;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: var(--text-main);
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+            transition: all 0.3s ease;
+        }
+        .map-node.master-node { 
+            border-color: var(--primary); 
+            color: var(--primary);
+            background: #eff6ff;
+            z-index: 1000 !important; 
+        }
+        .map-node.slave-node { border-color: var(--accent); color: var(--accent); }
+        .map-node.alert { 
+            border-color: var(--danger); 
+            background: #fef2f2;
+            color: var(--danger);
+            animation: pulse-alert 1s infinite; 
+        }
+
+        @keyframes pulse-alert {
+            0% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.6); }
+            70% { box-shadow: 0 0 0 15px rgba(239, 68, 68, 0); }
+            100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0); }
+        }
+
+        .packet-layer {
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+            pointer-events: none; z-index: 999;
+        }
+        .packet {
+            position: absolute; width: 12px; height: 12px;
+            background: var(--accent); border: 2px solid #fff;
+            border-radius: 50%; box-shadow: 0 2px 5px rgba(0,0,0,0.2);
+            transform: translate(-50%, -50%);
+        }
+
+        /* --- UI Components --- */
+        h2 { 
+            font-size: 0.85rem; margin: 0 0 12px 0; color: var(--text-muted); 
+            text-transform: uppercase; letter-spacing: 0.05em; font-weight: 700;
+            display: flex; align-items: center; gap: 6px;
+        }
+
+        .card {
+            background: #fff; border: 1px solid var(--border-color);
+            border-radius: 10px; padding: 16px; margin-bottom: 16px;
+            box-shadow: 0 1px 2px rgba(0,0,0,0.05); transition: transform 0.2s;
+        }
+        .card:hover { transform: translateY(-2px); box-shadow: 0 4px 6px rgba(0,0,0,0.05); }
+
+        .metric-row { display: flex; justify-content: space-between; margin-bottom: 8px; font-size: 0.85rem; color: var(--text-muted); }
+        .metric-val { font-family: 'Courier New', monospace; font-weight: 700; color: var(--text-main); }
+
+        .btn {
+            width: 100%; background: #fff; border: 1px solid var(--border-color);
+            color: var(--text-main); padding: 10px; border-radius: 8px;
+            cursor: pointer; font-weight: 600; font-size: 0.9rem;
+            display: flex; align-items: center; justify-content: center; gap: 8px;
+            transition: all 0.2s;
+        }
+        .btn:hover { background: #f1f5f9; }
+        .btn:active { transform: scale(0.98); }
+        .btn-primary { background: var(--primary); color: white; border: none; }
+        .btn-primary:hover { background: #2563eb; }
+        .btn-success { background: #10b981; color: white; border: none; }
+        .btn-success:hover { background: #059669; }
+        .btn-danger-outline {
+            background: transparent; color: var(--danger); border: 1px solid #fecaca;
+            margin-top: 12px; font-size: 0.8rem; padding: 8px;
+        }
+        .btn-danger-outline:hover { background: #fef2f2; border-color: var(--danger); }
+
+        .hud-status {
+            position: absolute; top: 20px; left: 20px; z-index: 1000;
+            background: rgba(255, 255, 255, 0.95); padding: 8px 12px; border-radius: 8px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1); font-weight: 600; font-size: 0.8rem;
+            display: flex; align-items: center; gap: 8px; border: 1px solid var(--border-color);
+        }
+        .blinking-dot { width: 8px; height: 8px; background: #cbd5e1; border-radius: 50%; }
+        .blinking-dot.active { background: var(--accent); animation: blink 0.5s infinite; }
+        @keyframes blink { 50% { opacity: 0; } }
+
+        input[type=range] { width: 100%; accent-color: var(--primary); cursor: pointer; }
+    </style>
+</head>
+<body>
+
+    <div class="sidebar">
+        <div>
+            <h2><span class="material-icons-round">tune</span> Controls</h2>
+            <button class="btn btn-primary" style="margin-bottom:10px;" onclick="toggleSystem()">
+                <span class="material-icons-round">power_settings_new</span> 
+                <span id="pwr-text">Power On</span>
+            </button>
+            <button class="btn" onclick="toggleAudio()" id="audioBtn">
+                <span class="material-icons-round">volume_off</span> 
+                <span id="audioText">Enable Sound</span>
+            </button>
+        </div>
+
+        <div>
+            <h2><span class="material-icons-round">gps_fixed</span> GPS Simulation</h2>
+            <div class="card">
+                <label style="font-size:0.75rem; font-weight:bold;">Node 1 Dist</label>
+                <input type="range" min="0.002" max="0.015" step="0.0001" value="0.005" oninput="moveNode(0, this.value)">
+                <label style="font-size:0.75rem; font-weight:bold;">Node 2 Dist</label>
+                <input type="range" min="0.002" max="0.015" step="0.0001" value="0.008" oninput="moveNode(1, this.value)">
+                <label style="font-size:0.75rem; font-weight:bold;">Node 3 Dist</label>
+                <input type="range" min="0.002" max="0.015" step="0.0001" value="0.006" oninput="moveNode(2, this.value)">
+            </div>
+        </div>
+
+        <div class="console-wrapper">
+            <h2><span class="material-icons-round">terminal</span> Serial Monitor</h2>
+            <div class="console" id="console">
+                <div class="log-entry">> LoRa Master v3.0 Ready...</div>
+                <div class="log-entry">> Location: Bengaluru, IN</div>
+            </div>
+        </div>
+    </div>
+
+    <div class="main-stage">
+        <div id="map"></div>
+        <div class="packet-layer" id="packetLayer"></div>
+        <div class="hud-status">
+            <div class="blinking-dot" id="spiffs-dot"></div>
+            <span>SPIFFS: <span id="spiffs-state">IDLE</span></span>
+        </div>
+    </div>
+
+    <div class="telemetry-panel">
+        <h2><span class="material-icons-round">analytics</span> Live Sensor Data</h2>
+        <div id="telemetry-container"></div>
+    </div>
+
+<script>
+    // ================= CONFIGURATION =================
+    const CENTER_LAT = 12.9716;
+    const CENTER_LON = 77.5946;
+
+    const NODES = [
+        { id: "NODE1", angle: 45,  offset: 0.005, color: "#10b981", lat: 0, lon: 0 },
+        { id: "NODE2", angle: 160, offset: 0.008, color: "#f59e0b", lat: 0, lon: 0 },
+        { id: "NODE3", angle: 280, offset: 0.006, color: "#6366f1", lat: 0, lon: 0 }
+    ];
+
+    const nodeData = {}; 
+    NODES.forEach(n => {
+        nodeData[n.id] = { temp: 24.0, alt: 920, bat: 100, alert: 0, rssi: -60, chart: null };
+    });
+
+    let system = { on: false, audio: false, pollIdx: 0, polylines: [] };
+    let audioCtx, pollTimer;
+
+    // ================= MAP SETUP =================
+    const map = L.map('map', { zoomControl: false }).setView([CENTER_LAT, CENTER_LON], 15);
+    L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png', {
+        attribution: '© OpenStreetMap, © CartoDB', maxZoom: 19
+    }).addTo(map);
+
+    const masterIcon = L.divIcon({
+        className: 'custom-div-icon',
+        html: `<div class="map-node master-node" style="width:40px; height:40px;"><span class="material-icons-round">router</span></div>`,
+        iconSize: [40, 40]
+    });
+    L.marker([CENTER_LAT, CENTER_LON], {icon: masterIcon}).addTo(map);
+
+    const slaveMarkers = {};
+    NODES.forEach((n, i) => {
+        updateNodeGeo(i);
+        const icon = L.divIcon({
+            className: 'custom-div-icon',
+            html: `<div class="map-node slave-node" id="marker-${n.id}" style="width:32px; height:32px; border-color:${n.color}; color:${n.color}">
+                    <span class="material-icons-round" style="font-size:18px">memory</span></div>`,
+            iconSize: [32, 32]
+        });
+        slaveMarkers[n.id] = L.marker([n.lat, n.lon], {icon: icon}).addTo(map);
+        const line = L.polyline([[CENTER_LAT, CENTER_LON], [n.lat, n.lon]], {
+            color: '#94a3b8', weight: 1, dashArray: '4, 8'
+        }).addTo(map);
+        system.polylines.push(line);
+    });
+
+    // ================= UI SETUP =================
+    function initUI() {
+        const container = document.getElementById('telemetry-container');
+        NODES.forEach(n => {
+            const div = document.createElement('div');
+            div.className = 'card';
+            div.innerHTML = `
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
+                    <span style="font-weight:700; color:${n.color}; display:flex; align-items:center; gap:6px;">
+                        <span class="material-icons-round" style="font-size:16px;">circle</span> ${n.id}
+                    </span>
+                    <span id="badge-${n.id}" style="display:none; background:#fee2e2; color:#dc2626; padding:4px 8px; border-radius:4px; font-size:0.7rem; font-weight:bold;">⚠️ ALERT</span>
+                </div>
+                <div class="metric-row"><span>Temp</span> <span class="metric-val" id="t-${n.id}">-- °C</span></div>
+                <div class="metric-row"><span>Altitude</span> <span class="metric-val" id="a-${n.id}">-- m</span></div>
+                <div class="metric-row"><span>Battery</span> <span class="metric-val" id="b-${n.id}">-- %</span></div>
+                <div class="metric-row"><span>RSSI</span> <span class="metric-val" id="r-${n.id}">-- dBm</span></div>
+                <div style="height:60px; margin:12px 0;"><canvas id="chart-${n.id}"></canvas></div>
+                <button class="btn btn-danger-outline" onclick="triggerAlert('${n.id}')">
+                    <span class="material-icons-round" style="font-size:16px;">warning_amber</span> Trigger ${n.id} Alert
+                </button>
+            `;
+            container.appendChild(div);
+
+            const ctx = document.getElementById(`chart-${n.id}`).getContext('2d');
+            nodeData[n.id].chart = new Chart(ctx, {
+                type: 'line',
+                data: { labels: Array(15).fill(''), datasets: [{ data: Array(15).fill(null), borderColor: n.color, borderWidth: 2, pointRadius: 0, tension: 0.4 }] },
+                options: { responsive:true, maintainAspectRatio:false, plugins:{legend:false}, scales:{x:{display:false}, y:{display:false, min: 20, max: 35}} }
+            });
+        });
+    }
+
+    // ================= LOGIC =================
+    function updateNodeGeo(idx) {
+        const n = NODES[idx];
+        const rLat = n.offset; 
+        const rLon = n.offset / Math.cos(CENTER_LAT * Math.PI/180);
+        const rad = n.angle * (Math.PI / 180);
+        n.lat = CENTER_LAT + (rLat * Math.cos(rad));
+        n.lon = CENTER_LON + (rLon * Math.sin(rad));
+    }
+
+    window.moveNode = function(idx, val) {
+        NODES[idx].offset = parseFloat(val);
+        updateNodeGeo(idx);
+        slaveMarkers[NODES[idx].id].setLatLng([NODES[idx].lat, NODES[idx].lon]);
+        system.polylines[idx].setLatLngs([[CENTER_LAT, CENTER_LON], [NODES[idx].lat, NODES[idx].lon]]);
+        const distRatio = (NODES[idx].offset - 0.002) / (0.015 - 0.002);
+        nodeData[NODES[idx].id].rssi = Math.floor(-50 - (distRatio * 70));
+    }
+
+    window.toggleSystem = function() {
+        system.on = !system.on;
+        document.getElementById('pwr-text').innerText = system.on ? "Power Off" : "Power On";
+        const btn = document.querySelector('.btn-primary');
+        if(system.on) {
+            btn.style.background = "#ef4444"; 
+            log("System Booting...", "#fff");
+            pollTimer = setInterval(masterLoop, 3000);
+        } else {
+            btn.style.background = "#3b82f6";
+            log("System Shutdown", "#94a3b8");
+            clearInterval(pollTimer);
+        }
+    }
+
+    function masterLoop() {
+        const target = NODES[system.pollIdx];
+        log(`[TX] REQ: ${target.id}`, '#f59e0b');
+        animatePacket([CENTER_LAT, CENTER_LON], [target.lat, target.lon], '#f59e0b', () => {
+            setTimeout(() => slaveResponse(target), 200);
+        });
+        system.pollIdx = (system.pollIdx + 1) % NODES.length;
+    }
+
+    function slaveResponse(n) {
+        const d = nodeData[n.id];
+        d.temp += (Math.random() - 0.5);
+        d.alt  = 920 + (Math.random() * 2 - 1);
+        d.bat  = Math.max(0, d.bat - 0.05);
+        const color = d.alert ? '#dc2626' : n.color;
+        
+        animatePacket([n.lat, n.lon], [CENTER_LAT, CENTER_LON], color, () => {
+            handleRx(n.id, d);
+            if(d.alert) d.alert = 0; 
+        });
+    }
+
+    function handleRx(id, d) {
+        log(`[RX] ${id} | Alt:${d.alt.toFixed(0)}m | RSSI:${d.rssi}`, '#38bdf8');
+        document.getElementById(`t-${id}`).innerText = d.temp.toFixed(1) + " °C";
+        document.getElementById(`a-${id}`).innerText = d.alt.toFixed(0) + " m";
+        document.getElementById(`b-${id}`).innerText = Math.floor(d.bat) + " %";
+        document.getElementById(`r-${id}`).innerText = d.rssi + " dBm";
+        
+        const dot = document.getElementById('spiffs-dot');
+        const txt = document.getElementById('spiffs-state');
+        dot.classList.add('active'); txt.innerText = "WRITING"; txt.style.color = "#f59e0b";
+        setTimeout(() => { dot.classList.remove('active'); txt.innerText = "IDLE"; txt.style.color = "#0f172a"; }, 500);
+
+        const c = d.chart;
+        c.data.datasets[0].data.push(d.temp);
+        c.data.datasets[0].data.shift();
+        c.update();
+
+        if(d.alert) {
+            document.getElementById(`badge-${id}`).style.display = "inline";
+            document.getElementById(`marker-${id}`).classList.remove('alert');
+            broadcastAlert();
+        } else {
+            document.getElementById(`badge-${id}`).style.display = "none";
+        }
+    }
+
+    function animatePacket(start, end, color, onDone) {
+        const layer = document.getElementById('packetLayer');
+        const p = document.createElement('div');
+        p.className = 'packet';
+        p.style.background = color;
+        layer.appendChild(p);
+        const startTime = performance.now();
+        const duration = 800;
+
+        function step(now) {
+            const prog = Math.min((now - startTime)/duration, 1);
+            const lat = start[0] + (end[0] - start[0]) * prog;
+            const lon = start[1] + (end[1] - start[1]) * prog;
+            const pt = map.latLngToContainerPoint([lat, lon]);
+            p.style.left = pt.x + 'px'; p.style.top = pt.y + 'px';
+            if(prog < 1) requestAnimationFrame(step);
+            else { p.remove(); if(onDone) onDone(); }
+        }
+        requestAnimationFrame(step);
+    }
+
+    window.triggerAlert = function(id) {
+        if(!system.on) { log("Error: System is OFF", "#ef4444"); return; }
+        nodeData[id].alert = 1;
+        document.getElementById(`marker-${id}`).classList.add('alert');
+        log(`[BTN] ${id} Alert Pending...`, '#cbd5e1');
+        beep(1000, 100, 'sawtooth');
+    }
+
+    function broadcastAlert() {
+        log("🚨 BROADCASTING ALERT", '#ef4444');
+        beep(600, 200, 'square'); setTimeout(() => beep(600, 200, 'square'), 300);
+        NODES.forEach(n => animatePacket([CENTER_LAT, CENTER_LON], [n.lat, n.lon], '#ef4444'));
+    }
+
+    function log(msg, color) {
+        const c = document.getElementById('console');
+        const d = document.createElement('div');
+        d.className = 'log-entry';
+        d.style.borderColor = color;
+        d.style.color = color === '#fff' ? '#fff' : (color === '#ef4444' ? '#fca5a5' : '#cbd5e1');
+        d.innerHTML = `> ${msg}`;
+        c.appendChild(d);
+        c.scrollTop = c.scrollHeight;
+    }
+
+    window.toggleAudio = function() {
+        const btn = document.getElementById('audioBtn');
+        const txt = document.getElementById('audioText');
+        if(!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        if(audioCtx.state === 'suspended') audioCtx.resume();
+        system.audio = !system.audio;
+        if (system.audio) {
+            btn.className = "btn btn-success";
+            txt.innerText = "Sound: ON";
+            btn.querySelector('.material-icons-round').innerText = "volume_up";
+        } else {
+            btn.className = "btn";
+            txt.innerText = "Enable Sound";
+            btn.querySelector('.material-icons-round').innerText = "volume_off";
+        }
+    }
+
+    function beep(freq, dur, type) {
+        if(!system.audio || !audioCtx) return;
+        const o = audioCtx.createOscillator();
+        const g = audioCtx.createGain();
+        o.type = type; o.frequency.value = freq;
+        o.connect(g); g.connect(audioCtx.destination);
+        o.start(); g.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + dur/1000);
+        setTimeout(() => o.stop(), dur);
+    }
+
+    initUI();
+</script>
+</body>
+</html>
